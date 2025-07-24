@@ -3,17 +3,16 @@
 #include <string.h>
 #include <cuda_runtime.h>
 #include <chrono>
+#include <stdlib.h>
 
 #define HASH_LEN     32      // MD5 hex string length
 #define PW_MAXLEN     8      // max password length
 #define BLOCK_SIZE  256
-// how many candidate passwords per batch (tunable)
-#define BATCH_SIZE (1<<20)   // 1M passwords per host‑kernel launch
+#define BATCH_SIZE (1<<20)   // 1M passwords per host–kernel launch
 
 //---------------------------------------------------------------------------
-// device MD5 (same as before)
+// Device-side MD5 implementation
 //---------------------------------------------------------------------------
-
 __device__ const uint32_t md5_k[64] = {
     0xd76aa478,0xe8c7b756,0x242070db,0xc1bdceee,0xf57c0faf,0x4787c62a,0xa8304613,0xfd469501,
     0x698098d8,0x8b44f7af,0xffff5bb1,0x895cd7be,0x6b901122,0xfd987193,0xa679438e,0x49b40821,
@@ -42,120 +41,120 @@ __device__ void to_hex(uint8_t *in, char *out) {
 }
 
 __device__ void md5(const char *msg, int len, char *out_hex) {
-    uint8_t buf[64]={0};
+    uint8_t buf[64] = {0};
     uint32_t a0=0x67452301, b0=0xefcdab89, c0=0x98badcfe, d0=0x10325476;
-    // copy & pad
     #pragma unroll
-    for(int i=0;i<len;i++) buf[i]=msg[i];
-    buf[len]=0x80;
-    uint64_t bits=len*8;
-    buf[56]=bits; buf[57]=bits>>8; buf[58]=bits>>16; buf[59]=bits>>24;
-    uint32_t *w=(uint32_t*)buf;
-    uint32_t A=a0,B=b0,C=c0,D=d0;
+    for(int i=0;i<len;i++) buf[i] = (uint8_t)msg[i];
+    buf[len] = 0x80;
+    uint64_t bits = (uint64_t)len * 8;
+    buf[56] = bits & 0xFF; buf[57] = (bits>>8)&0xFF;
+    buf[58] = (bits>>16)&0xFF; buf[59] = (bits>>24)&0xFF;
+
+    uint32_t *w = (uint32_t*)buf;
+    uint32_t A=a0, B=b0, C=c0, D=d0;
     #pragma unroll
     for(int i=0;i<64;i++){
-        uint32_t F,g;
+        uint32_t F, g;
         if(i<16){ F=(B&C)|(~B&D); g=i; }
         else if(i<32){ F=(D&B)|(~D&C); g=(5*i+1)%16; }
         else if(i<48){ F=B^C^D;       g=(3*i+5)%16; }
         else         { F=C^(B|~D);    g=(7*i)%16; }
         F += A + md5_k[i] + w[g];
-        A=D; D=C; C=B;
+        A = D; D = C; C = B;
         B += (F<<md5_r[i]) | (F>>(32-md5_r[i]));
     }
     uint8_t digest[16];
-    ((uint32_t*)digest)[0]=a0+A;
-    ((uint32_t*)digest)[1]=b0+B;
-    ((uint32_t*)digest)[2]=c0+C;
-    ((uint32_t*)digest)[3]=d0+D;
+    ((uint32_t*)digest)[0] = a0 + A;
+    ((uint32_t*)digest)[1] = b0 + B;
+    ((uint32_t*)digest)[2] = c0 + C;
+    ((uint32_t*)digest)[3] = d0 + D;
     to_hex(digest, out_hex);
 }
 
-__device__ void idx_to_pw(uint64_t idx,int pw_len,char *cs,int cs_len,char *out){
-    for(int i=pw_len-1;i>=0;i--){
-        out[i]=cs[idx%cs_len];
-        idx/=cs_len;
+__device__ void idx_to_pw(uint64_t idx, int pw_len, char *cs, int cs_len, char *out) {
+    for(int i=pw_len-1;i>=0;i--) {
+        out[i] = cs[idx % cs_len];
+        idx /= cs_len;
     }
-    out[pw_len]=0;
+    out[pw_len] = '\0';
 }
 
-__device__ int my_strncmp(const char *a,const char *b,int n){
-    for(int i=0;i<n;i++){
-        if(a[i]!=b[i]) return a[i]-b[i];
-    }
+__device__ int my_strncmp(const char *a, const char *b, int n) {
+    for(int i=0;i<n;i++) if(a[i]!=b[i]) return (int)(unsigned char)a[i] - (int)(unsigned char)b[i];
     return 0;
 }
 
 //---------------------------------------------------------------------------
-// kernel with base offset
+// Kernel with offset base
 //---------------------------------------------------------------------------
 __global__ void crack_kernel(const char *d_hash, int pw_len,
-                             char *charset, int cs_len,
+                             const char *charset, int cs_len,
                              uint64_t total, int *d_found,
                              uint64_t *d_found_idx, char *d_found_pw,
                              uint64_t base)
 {
-    uint64_t tid = blockIdx.x*(uint64_t)blockDim.x + threadIdx.x;
+    uint64_t tid = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x;
     uint64_t idx = base + tid;
-    if(idx>=total || *d_found) return;
+    if(idx >= total || *d_found) return;
 
     char pw[PW_MAXLEN+1], hash[HASH_LEN+1];
-    idx_to_pw(idx, pw_len, charset, cs_len, pw);
+    idx_to_pw(idx, pw_len, (char*)charset, cs_len, pw);
     md5(pw, pw_len, hash);
-
-    if(my_strncmp(hash, d_hash, HASH_LEN)==0){
+    if(my_strncmp(hash, d_hash, HASH_LEN) == 0) {
         *d_found = 1;
         *d_found_idx = idx;
-        #pragma unroll
-        for(int i=0;i<=pw_len;i++) d_found_pw[i]=pw[i];
+        for(int i=0; i<=pw_len; i++) d_found_pw[i] = pw[i];
     }
 }
 
 //---------------------------------------------------------------------------
-// host
+// Host side with args parsing
 //---------------------------------------------------------------------------
-int main(){
-    // 1) read inputs
-    char target[HASH_LEN+2]; int pw_len;
-    printf("MD5 hash (32 hex chars): ");
-    fgets(target, sizeof(target), stdin);
-    target[strcspn(target,"\n")]=0;
+int main(int argc, char *argv[]) {
+    if(argc != 3) {
+        fprintf(stderr, "Usage: %s <md5-hash> <password-length>\n", argv[0]);
+        return 1;
+    }
+    const char *target = argv[1];
+    int pw_len = atoi(argv[2]);
+    if(strlen(target) != HASH_LEN || pw_len < 1 || pw_len > PW_MAXLEN) {
+        fprintf(stderr, "Invalid arguments. Hash must be %d hex chars, length 1-%d.\n", HASH_LEN, PW_MAXLEN);
+        return 1;
+    }
 
-    printf("Password length (1-%d): ", PW_MAXLEN);
-    scanf("%d",&pw_len);
-    if(pw_len<1||pw_len>PW_MAXLEN) return puts("invalid len"),1;
-
-    // 2) setup
-    const char charset[]="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    // Prepare charset and calculate total combinations
+    const char charset[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     int cs_len = strlen(charset);
-    uint64_t total=1;
-    for(int i=0;i<pw_len;i++) total*=cs_len;
+    uint64_t total = 1;
+    for(int i=0; i<pw_len; i++) total *= cs_len;
 
-    // device allocations
+    // Allocate and copy to device
     char *d_hash, *d_cs, *d_pw;
     int *d_found; uint64_t *d_fidx;
-    cudaMalloc(&d_hash, HASH_LEN+1);
-    cudaMalloc(&d_cs,  cs_len);
+    cudaMalloc(&d_hash, HASH_LEN + 1);
+    cudaMalloc(&d_cs, cs_len);
     cudaMalloc(&d_found, sizeof(int));
-    cudaMalloc(&d_fidx,  sizeof(uint64_t));
-    cudaMalloc(&d_pw,    PW_MAXLEN+1);
+    cudaMalloc(&d_fidx, sizeof(uint64_t));
+    cudaMalloc(&d_pw, PW_MAXLEN + 1);
+
     cudaMemcpy(d_hash, target, HASH_LEN, cudaMemcpyHostToDevice);
     cudaMemcpy(d_cs, charset, cs_len, cudaMemcpyHostToDevice);
-    int found=0; uint64_t fidx=0;
-    cudaMemcpy(d_found,&found,sizeof(int),cudaMemcpyHostToDevice);
-    cudaMemcpy(d_fidx,&fidx,sizeof(uint64_t),cudaMemcpyHostToDevice);
+    int found = 0; uint64_t fidx = 0;
+    cudaMemcpy(d_found, &found, sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_fidx, &fidx, sizeof(uint64_t), cudaMemcpyHostToDevice);
 
-    // 3) loop batches
-    uint64_t processed=0;
+    uint64_t processed = 0;
     auto t0 = std::chrono::high_resolution_clock::now();
-    for(uint64_t base=0; base<total && !found; base+=BATCH_SIZE){
-        uint64_t remain = total-base;
+
+    // Loop over batches
+    for(uint64_t base = 0; base < total && !found; base += BATCH_SIZE) {
+        uint64_t remain = total - base;
         uint64_t batch = remain < BATCH_SIZE ? remain : BATCH_SIZE;
-        int blocks = (batch + BLOCK_SIZE -1) / BLOCK_SIZE;
+        int blocks = (batch + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
         crack_kernel<<<blocks, BLOCK_SIZE>>>(
-            d_hash,pw_len,d_cs,cs_len,total,
-            d_found,d_fidx,d_pw, base
+            d_hash, pw_len, d_cs, cs_len,
+            total, d_found, d_fidx, d_pw, base
         );
         cudaDeviceSynchronize();
 
@@ -163,27 +162,24 @@ int main(){
         auto tn = std::chrono::high_resolution_clock::now();
         double sec = std::chrono::duration<double>(tn - t0).count();
         double hps = processed / sec;
-        // overwrite single line
-        printf("\r%llu/%llu hashes processed — %.2f H/s",
-               (unsigned long long)processed,
-               (unsigned long long)total,
-               hps);
-        fflush(stdout);
+        printf("\r%llu/%llu hashes — %.2f H/s",
+            (unsigned long long)processed,
+            (unsigned long long)total,
+            hps
+        ); fflush(stdout);
 
         cudaMemcpy(&found, d_found, sizeof(int), cudaMemcpyDeviceToHost);
     }
     puts(""); // newline
 
-    // 4) result
-    if(found){
-        char h_pw[PW_MAXLEN+1]={0};
-        cudaMemcpy(h_pw, d_pw, PW_MAXLEN+1, cudaMemcpyDeviceToHost);
-        printf("FOUND at index %llu: %s\n",
-               (unsigned long long)fidx, h_pw);
+    if(found) {
+        char h_pw[PW_MAXLEN+1] = {0};
+        cudaMemcpy(h_pw, d_pw, PW_MAXLEN + 1, cudaMemcpyDeviceToHost);
+        printf("FOUND at index %llu: %s\n", (unsigned long long)fidx, h_pw);
     } else {
         puts("Not found.");
     }
-    // cleanup
+
     cudaFree(d_hash); cudaFree(d_cs);
     cudaFree(d_found); cudaFree(d_fidx); cudaFree(d_pw);
     return 0;
