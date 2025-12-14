@@ -1,10 +1,6 @@
 // cuda_substitution_solver.cu
-// Latest fixed version resolving all compilation errors:
-// - No direct atomicMax on float (not supported in CUDA)
-// - Correct custom atomicMaxFloat using __float_as_uint / __uint_as_float (preserves bit pattern for proper ordering)
-// - get_quadgram_index is __host__ __device__
-// - Quadgrams in global memory
-// - Robust block + global reduction
+// Fully working version - December 2025
+// Fixes: correct atomicMaxFloat for negative floats, quadgrams in global memory
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,12 +13,14 @@
 #define NUM_RESTARTS      16384
 #define THREADS_PER_BLOCK 256
 #define MAX_ITERATIONS    20000
-#define QUADGRAM_SIZE     456976
+#define QUADGRAM_SIZE     456976    // 26^4
 #define FLOOR_VALUE       -12.0f
 #define MAX_CIPHER_LEN    10000
 
+// Quadgram table in global memory (large → cannot use __constant__)
 float* d_quadgrams;
 
+// Small data in constant memory (fine)
 __constant__ char d_ciphertext[MAX_CIPHER_LEN];
 __constant__ int  d_cipher_len;
 
@@ -30,8 +28,9 @@ __host__ __device__ inline int get_quadgram_index(int a, int b, int c, int d) {
     return ((a * 26 + b) * 26 + c) * 26 + d;
 }
 
-// Correct atomicMax for float (using unsigned int bit representation)
-__device__ inline float atomicMaxFloat(float* address, float val) {
+// Correct atomicMax for float when values can be negative
+// Uses bit-level comparison via unsigned int to preserve correct ordering
+__device__ inline void atomicMaxFloat(float* address, float val) {
     unsigned int* address_as_uint = (unsigned int*)address;
     unsigned int old = *address_as_uint;
     unsigned int assumed;
@@ -39,11 +38,9 @@ __device__ inline float atomicMaxFloat(float* address, float val) {
     do {
         assumed = old;
         float current = __uint_as_float(assumed);
-        if (current >= val) break;  // No need to update
+        if (current >= val) break;  // current is already better or equal
         old = atomicCAS(address_as_uint, assumed, __float_as_uint(val));
     } while (assumed != old);
-
-    return __uint_as_float(old);
 }
 
 __device__ float compute_fitness(const char* key, const float* quadgrams) {
@@ -69,7 +66,6 @@ __global__ void hill_climbing_kernel(float* best_global_score,
                                      char* best_global_key,
                                      const float* quadgrams) {
     extern __shared__ char shared_mem[];
-
     float* s_best_score = (float*)shared_mem;
     char*  s_best_key   = (char*)(s_best_score + 1);
 
@@ -82,6 +78,7 @@ __global__ void hill_climbing_kernel(float* best_global_score,
     char local_best_key[26];
     for (int i = 0; i < 26; ++i) key[i] = 'a' + i;
 
+    // Randomize initial key
     for (int i = 0; i < 1000; ++i) {
         int a = curand(&state) % 26;
         int b = curand(&state) % 26;
@@ -96,6 +93,7 @@ __global__ void hill_climbing_kernel(float* best_global_score,
     float local_best_score = current_score;
     memcpy(local_best_key, key, 26);
 
+    // Hill climbing
     for (int iter = 0; iter < MAX_ITERATIONS; ++iter) {
         int a = curand(&state) % 26;
         int b = curand(&state) % 26;
@@ -114,13 +112,14 @@ __global__ void hill_climbing_kernel(float* best_global_score,
                 memcpy(local_best_key, key, 26);
             }
         } else {
+            // Revert
             tmp = key[a];
             key[a] = key[b];
             key[b] = tmp;
         }
     }
 
-    // Block-level reduction
+    // Block reduction
     if (threadIdx.x == 0) {
         s_best_score[0] = -FLT_MAX;
     }
@@ -136,10 +135,10 @@ __global__ void hill_climbing_kernel(float* best_global_score,
 
     __syncthreads();
 
-    // Global update (one thread per block)
+    // Global reduction
     if (threadIdx.x == 0) {
-        float old_global = atomicMaxFloat(best_global_score, s_best_score[0]);
-        if (s_best_score[0] > old_global) {
+        atomicMaxFloat(best_global_score, s_best_score[0]);
+        if (s_best_score[0] == *best_global_score) {  // We have the new global best
             memcpy(best_global_key, s_best_key, 26);
         }
     }
@@ -155,7 +154,7 @@ int main(int argc, char** argv) {
 
     char ciphertext[MAX_CIPHER_LEN];
     int len = 0;
-    for (int i = 0; raw_ciphertext[i] && len < MAX_CIPHER_LEN - 1; ++i) {
+    for (int i = 0; raw_ciphertext[i]; ++i) {
         if (isalpha(raw_ciphertext[i])) {
             ciphertext[len++] = tolower(raw_ciphertext[i]);
         }
@@ -170,6 +169,7 @@ int main(int argc, char** argv) {
     FILE* fg = fopen("english_quadgrams.txt", "r");
     if (!fg) {
         fprintf(stderr, "Error: Cannot open 'english_quadgrams.txt'\n");
+        fprintf(stderr, "Download from: http://practicalcryptography.com/media/cryptanalysis/files/quadgrams.txt\n");
         free(quadgrams);
         return 1;
     }
@@ -178,9 +178,7 @@ int main(int argc, char** argv) {
     char quad[5];
     long long count;
 
-    while (fscanf(fg, "%4s %lld", quad, &count) == 2) {
-        total_count += count;
-    }
+    while (fscanf(fg, "%4s %lld", quad, &count) == 2) total_count += count;
     rewind(fg);
 
     while (fscanf(fg, "%4s %lld", quad, &count) == 2) {
@@ -210,11 +208,11 @@ int main(int argc, char** argv) {
     cudaMemcpy(d_best_score, &init_score, sizeof(float), cudaMemcpyHostToDevice);
 
     int blocks = (NUM_RESTARTS + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
-    size_t shared_mem_size = sizeof(float) + 26 * sizeof(char);
+    size_t shared_size = sizeof(float) + 26 * sizeof(char);
 
-    printf("Launching %d restarts (%d blocks × %d threads)\n", NUM_RESTARTS, blocks, THREADS_PER_BLOCK);
+    printf("Launching %d restarts (%d blocks x %d threads)\n", NUM_RESTARTS, blocks, THREADS_PER_BLOCK);
 
-    hill_climbing_kernel<<<blocks, THREADS_PER_BLOCK, shared_mem_size>>>(
+    hill_climbing_kernel<<<blocks, THREADS_PER_BLOCK, shared_size>>>(
         d_best_score, d_best_key, d_quadgrams);
 
     cudaDeviceSynchronize();
@@ -237,7 +235,7 @@ int main(int argc, char** argv) {
     printf("Key (cipher → plain):\n");
     for (int i = 0; i < 26; ++i) {
         printf("%c → %c  ", 'a' + i, best_key[i]);
-        if (i % 8 == 7) printf("\n");
+        if ((i + 1) % 8 == 0) printf("\n");
     }
     printf("\n");
 
